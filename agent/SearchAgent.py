@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import TypedDict, List, Annotated
 
 import dotenv
+os.environ.setdefault("USER_AGENT", "multi-agent/1.0")
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.messages import BaseMessage, ToolMessage, HumanMessage
 from langchain_core.tools import tool

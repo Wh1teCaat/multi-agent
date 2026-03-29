@@ -1,9 +1,11 @@
+import ast
 import os
-from typing import TypedDict, Annotated, Optional
+import re
+from typing import Any, TypedDict, Annotated, Optional
 
 import dotenv
 import tiktoken
-from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 from langchain_openai import ChatOpenAI
@@ -11,10 +13,30 @@ from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-from RAGAgent import call_rag_expert
-from SearchAgent import call_search_expert
+from tool_registry import build_default_tool_specs, build_tool_maps
+from tools.task_tools import interactive_yes_no
 
 dotenv.load_dotenv()
+
+
+RECALL_PATTERNS = [
+    r"刚刚",
+    r"上一次|上个",
+    r"之前",
+    r"回顾",
+    r"总结上文|复述上文|回忆",
+    r"task\s*\d+.*(结论|结果|说了什么)",
+    r"我刚才.*(说|问)",
+    r"结论是什么",
+    r"结果是什么",
+]
+
+
+def _is_recall_query(text: str) -> bool:
+    if not text:
+        return False
+    normalized = text.strip().lower()
+    return any(re.search(p, normalized) for p in RECALL_PATTERNS)
 
 
 class Receipt(BaseModel):
@@ -50,24 +72,86 @@ class Agent:
     def __init__(self, runnable, pool):
         self.runnable = runnable
         self.pool = pool
+        self.thread_answer_cache: dict[str, list[str]] = {}
 
     @classmethod
     async def create(cls, max_tokens=5000):
         max_tokens = max_tokens
-        tools = [call_rag_expert, call_search_expert]
-        tools_by_name = {tool.name: tool for tool in tools}
+        tool_specs = build_default_tool_specs()
+        tools, tools_by_name, specs_by_name = build_tool_maps(tool_specs)
         llm = ChatOpenAI(model=os.getenv("MODEL_NAME"))
         llm_with_tools = llm.bind_tools(tools)
         llm_structured = llm.with_structured_output(Receipt)
 
+        def _last_user_text(messages: list[BaseMessage]) -> str:    # 取出消息列表最后的用户消息文本
+            for msg in reversed(messages):
+                if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
+                    return msg.content
+            return ""
+
+        def _sanitize_tool_call_sequence(messages: list[BaseMessage]) -> list[BaseMessage]:
+            """修复历史中不完整的 tool_call -> tool_message 序列。"""
+            fixed: list[BaseMessage] = []
+            i = 0
+            total = len(messages)
+
+            while i < total:
+                msg = messages[i]
+                fixed.append(msg)
+
+                calls = msg.tool_calls if isinstance(msg, AIMessage) else None
+                if not calls:
+                    i += 1
+                    continue
+
+                required_ids = [c.get("id") for c in calls if c.get("id")]
+                seen_ids: set[str] = set()
+
+                j = i + 1
+                while j < total and isinstance(messages[j], ToolMessage):
+                    tool_msg = messages[j]
+                    fixed.append(tool_msg)
+                    if tool_msg.tool_call_id:
+                        seen_ids.add(tool_msg.tool_call_id)
+                    j += 1
+
+                for call_id in required_ids:
+                    if call_id not in seen_ids:
+                        fixed.append(
+                            ToolMessage(
+                                content="Error: 历史会话缺失该 tool_call 的执行回执，已自动补齐占位回执。",
+                                tool_call_id=call_id,
+                            )
+                        )
+
+                i = j
+
+            return fixed
+
+        async def _human_confirm_tool_call(tool_name: str, args: dict[str, Any], confirm_key: str) -> bool | None:
+            """人在回路确认：返回 True/False；若环境不支持交互返回 None。"""
+            preview = {k: v for k, v in args.items() if k != confirm_key}
+            prompt = (
+                f"[agent] 工具 {tool_name} 需要人工确认。\n"
+                f"[agent] 参数预览: {preview}\n"
+                f"[agent] 是否继续并设置 {confirm_key}=true ? (y/n): "
+            )
+            return await interactive_yes_no(prompt)
+
         async def _structured_node(state: AgentState):
             messages = state["messages"]
             summary = state.get("summary", "")
+            messages = _sanitize_tool_call_sequence(messages)
 
             if summary:
-                prompt_msg = [SystemMessage(content=f"上下文摘要：{summary}")] + messages
+                prompt_msg = [
+                    SystemMessage(content=f"上下文摘要：{summary}"),
+                    SystemMessage(content="若上文存在 run_command 的工具回执，必须严格基于回执给出结论；禁止让用户再次手工去本地执行同一命令。"),
+                ] + messages
             else:
-                prompt_msg = messages
+                prompt_msg = [
+                    SystemMessage(content="若上文存在 run_command 的工具回执，必须严格基于回执给出结论；禁止让用户再次手工去本地执行同一命令。"),
+                ] + messages
 
             receipt = await llm_structured.ainvoke(prompt_msg)
             return {"structured_answer": receipt}
@@ -122,6 +206,7 @@ class Agent:
         async def _agent_node(state: AgentState):
             messages = state["messages"]
             summary = state.get("summary", "")
+            last_user_query = _last_user_text(messages)
 
             system_prompt = """你是一个高智能对话系统的**任务调度与决策中枢 (Central Orchestrator)**。
 
@@ -149,6 +234,14 @@ class Agent:
             1. **意图判别**：用户的最新意图属于上述哪种路径（A/B/C）？
             2. **上下文清洗**：确认是否需要忽略上文的干扰信息（如长文本）？
             3. **工具决策**：如果需要调用工具，理由是什么？
+
+            【执行任务优先】
+            当用户要求你“执行任务”（例如运行测试、检查文件、读取配置、给出执行证据）时，必须优先调用可用工具完成任务，而不是仅口头解释。
+            - 运行命令请优先以 dry-run 方式开始。
+            - dry-run 仅代表“计划执行”，不是“实际执行成功”；除非 dry_run=false 且拿到真实 stdout/stderr，否则不得声称命令已成功运行。
+            - 文件写入前必须明确拿到 confirm=true。
+            - 若用户要求执行 git 提交流程，必须分三次调用命令：`git add .`、`git commit -m "..."`、`git push`；严禁使用 `&&` 串联成一条命令。
+            - 最终回答需包含：结论、执行记录、证据、风险与回滚建议。
             
             【输出规范】
             1. **完整性原则**：如果用户要求生成长文本（作文、报告、代码），你必须生成用户需要的答案。
@@ -160,7 +253,18 @@ class Agent:
             if summary:
                 system_msg.append(SystemMessage(content=f"之前的对话摘要：{summary}"))
 
+            if _is_recall_query(last_user_query):
+                system_msg.append(
+                    SystemMessage(
+                        content=(
+                            "检测到这是历史回顾问题。严禁调用任何外部工具（含RAG/搜索/命令执行）；"
+                            "只能基于当前会话消息和摘要回答。若信息不足，明确说明缺失信息，不要编造。"
+                        )
+                    )
+                )
+
             messages = system_msg + messages
+            messages = _sanitize_tool_call_sequence(messages)
 
             result = await llm_with_tools.ainvoke(messages)
             return {"messages": [result]}
@@ -171,32 +275,86 @@ class Agent:
             if not last_msg.tool_calls:
                 return {}
 
-            tool_msgs = []
+            # 历史回顾类问题禁止调用工具，防止误触发 RAG/搜索造成答案漂移。
+            last_user_query = _last_user_text(state["messages"])
+            if _is_recall_query(last_user_query):
+                deny_msgs = []
+                for tool_call in last_msg.tool_calls:
+                    spec = specs_by_name.get(tool_call.get("name"))
+                    if spec and spec.policy.allow_in_recall:
+                        continue
+                    else:
+                        deny_msgs.append(
+                            ToolMessage(
+                                content=(
+                                    "Error: 该问题属于会话历史回顾，禁止调用外部工具。"
+                                    "请直接依据 messages/summary 回答。"
+                                ),
+                                tool_call_id=tool_call["id"],
+                            )
+                        )
+                if deny_msgs:
+                    return {"messages": deny_msgs}
+
+            tool_msgs: list[ToolMessage] = []
             for tool_call in last_msg.tool_calls:
-                name = tool_call["name"]
+                name = tool_call.get("name")
+                args = tool_call.get("args", {})
+
                 if name not in tools_by_name:
-                    output = f"Error: 调用不存在的工具"
+                    output = "Error: 调用不存在的工具"
                 else:
                     try:
+                        spec = specs_by_name.get(name)
+                        if spec and spec.policy.require_confirm_param:
+                            confirm_key = spec.policy.confirm_param_name
+                            confirmed = bool(args.get(confirm_key)) if isinstance(args, dict) else False
+                            if not confirmed:
+                                interactive = await _human_confirm_tool_call(
+                                    name,
+                                    args if isinstance(args, dict) else {},
+                                    confirm_key,
+                                )
+                                if interactive is True and isinstance(args, dict):
+                                    args = dict(args)
+                                    args[confirm_key] = True
+                                elif interactive is False:
+                                    output = (
+                                        f"Error: 用户拒绝执行工具 {name}，已取消本次写操作。"
+                                    )
+                                    tool_msgs.append(
+                                        ToolMessage(content=str(output), tool_call_id=tool_call["id"])
+                                    )
+                                    continue
+                                else:
+                                    output = (
+                                        f"Error: 工具 {name} 需要显式 {confirm_key}=true，"
+                                        "当前环境不支持交互确认，已拒绝执行。"
+                                    )
+                                    tool_msgs.append(
+                                        ToolMessage(content=str(output), tool_call_id=tool_call["id"])
+                                    )
+                                    continue
+
                         tool_func = tools_by_name[name]
-                        args = tool_call["args"]
                         output = await tool_func.ainvoke(args)
                     except Exception as e:
                         output = f"Error: {e}"
-                tool_msgs.append(
-                    ToolMessage(
-                        content=str(output),
-                        tool_call_id=tool_call["id"]
-                    )
-                )
+
+                tool_msgs.append(ToolMessage(content=str(output), tool_call_id=tool_call["id"]))
+
             return {"messages": tool_msgs}
 
         graph = StateGraph(AgentState)
+
         graph.add_node("summary", _summary_node)
         graph.add_node("agent", _agent_node)
         graph.add_node("tools", _tool_node)
+
         graph.add_node("formatter", _structured_node)
+        
         graph.set_entry_point("summary")
+        
         graph.add_edge("summary", "agent")
         graph.add_edge("tools", "agent")
 
@@ -242,6 +400,32 @@ class Agent:
         :param thread_id: 会话 ID，用于记忆隔离
         :return: 最终的结构化结果 (Receipt 对象) 或 错误信息
         """
+        def _enforce_dry_run_truth(user_query: str, answer_text: str) -> str:
+            q = (user_query or "").lower()
+            if "dry-run" not in q and "dry run" not in q and "dry_run" not in q:
+                return answer_text
+            risky_patterns = [r"运行成功", r"没有报错", r"测试通过", r"成功运行", r"全部通过"]
+            if any(re.search(p, answer_text) for p in risky_patterns):
+                return (
+                    "本次仅执行了 dry-run（计划演练），命令未实际运行，因此不能得出“测试通过/无报错”的结论。"
+                    "如需真实结果，请在确认后执行非 dry-run 的 pytest -q。"
+                )
+            return answer_text
+
+        # 回顾类问题改为“让模型基于记忆回答”，而不是只返回上一条缓存。
+        # 这里把本地缓存作为候选记忆注入，让模型综合 checkpoint 历史 + 摘要 + 候选结论给出回答。
+        if thread_id and _is_recall_query(query):
+            cached_answers = self.thread_answer_cache.get(thread_id, [])
+            if cached_answers:
+                recent = cached_answers[-8:]
+                memory_lines = "\n".join(f"- 记忆{i+1}: {item}" for i, item in enumerate(recent))
+                query = (
+                    f"{query}\n\n"
+                    "以下是当前 thread 的候选记忆，请你基于完整会话上下文与这些候选信息进行回顾，"
+                    "不要只机械复述最后一条：\n"
+                    f"{memory_lines}"
+                )
+
         inputs = {"messages": [HumanMessage(content=query)]}
         config = {"configurable": {"thread_id": thread_id}} if thread_id else None
 
@@ -250,9 +434,51 @@ class Agent:
 
         # 优先返回结构化答案，如果没有（比如出错了），返回最后一条文本消息
         if final_state.get("structured_answer"):
-            return final_state["structured_answer"]
+            receipt = final_state["structured_answer"]
+            receipt.answer = _enforce_dry_run_truth(query, receipt.answer)
+            if any(k in receipt.answer for k in ["请在本地终端中运行", "请运行以下命令", "重新确认执行"]):
+                for msg in reversed(final_state.get("messages", [])):
+                    if not isinstance(msg, ToolMessage):
+                        continue
+                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    if "executed_command" not in content:
+                        continue
+                    try:
+                        data = ast.literal_eval(content)
+                    except Exception:
+                        continue
+                    if isinstance(data, dict) and data.get("executed"):
+                        cmd = data.get("executed_command") or data.get("command")
+                        rc = data.get("returncode")
+                        hint = data.get("hint") or ""
+                        receipt.answer = f"命令已执行：{cmd}；returncode={rc}。{hint}".strip()
+                        break
+            if thread_id:
+                self.thread_answer_cache.setdefault(thread_id, []).append(receipt.answer)
+            return receipt
         else:
-            return final_state["messages"][-1].content
+            text = final_state["messages"][-1].content
+            text = _enforce_dry_run_truth(query, str(text))
+            if any(k in str(text) for k in ["请在本地终端中运行", "请运行以下命令", "重新确认执行"]):
+                for msg in reversed(final_state.get("messages", [])):
+                    if not isinstance(msg, ToolMessage):
+                        continue
+                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    if "executed_command" not in content:
+                        continue
+                    try:
+                        data = ast.literal_eval(content)
+                    except Exception:
+                        continue
+                    if isinstance(data, dict) and data.get("executed"):
+                        cmd = data.get("executed_command") or data.get("command")
+                        rc = data.get("returncode")
+                        hint = data.get("hint") or ""
+                        text = f"命令已执行：{cmd}；returncode={rc}。{hint}".strip()
+                        break
+            if thread_id:
+                self.thread_answer_cache.setdefault(thread_id, []).append(str(text))
+            return text
 
     async def aclose(self):
         await self.pool.close()

@@ -215,3 +215,5 @@ agent_db.sqlite
 learning/
 
 .vscode/
+# Ignore test directory under agent
+agent/test/
