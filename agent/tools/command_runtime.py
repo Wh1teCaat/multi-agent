@@ -32,6 +32,7 @@ SENSITIVE_COMMANDS = {
     "kubectl",
     "systemctl",
     "service",
+    "git",
     "rm",
     "mv",
     "chmod",

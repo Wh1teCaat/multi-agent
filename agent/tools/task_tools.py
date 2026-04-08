@@ -36,7 +36,6 @@ class CommandRunResult(BaseModel):
     command: str = Field(description="用户请求执行的原始命令。")
     executed_command: str = Field(description="实际执行的命令（可能经过回退改写）。")
 
-    dry_run: bool = Field(description="是否 dry-run 模式。")
     executed: bool = Field(description="是否真正执行了命令。")
 
     visible_in_terminal: bool = Field(default=False, description="是否在当前终端实时输出。")
@@ -143,14 +142,12 @@ def _resolve_text_path(path: str) -> Path:
 @tool
 async def run_command(
     command: str,
-    dry_run: bool = True,
     confirm: bool = False,
     visible_in_terminal: bool = False,
     open_new_terminal: bool = False,
 ) -> dict[str, Any]:
     """执行本地命令。
 
-    - dry_run=True: 仅返回计划，不执行。
     - confirm=True: 高风险命令（二次确认）允许真正执行。
     - visible_in_terminal=True: 在当前运行进程的终端直接展示执行过程。
     - open_new_terminal=True: 尝试打开系统新终端执行。
@@ -162,23 +159,10 @@ async def run_command(
             ok=False,
             command=command,
             executed_command=exec_command,
-            dry_run=dry_run,
             executed=False,
             visible_in_terminal=visible_in_terminal,
             open_new_terminal=open_new_terminal,
             error=f"command not allowed: {command}",
-        )
-
-    if dry_run:
-        return _result_dict(
-            ok=True,
-            command=command,
-            executed_command=exec_command,
-            dry_run=True,
-            executed=False,
-            visible_in_terminal=visible_in_terminal,
-            open_new_terminal=open_new_terminal,
-            message="dry-run 模式：命令未实际执行",
         )
 
     if requires_second_confirmation(exec_command) and not confirm:
@@ -191,7 +175,6 @@ async def run_command(
                 ok=False,
                 command=command,
                 executed_command=exec_command,
-                dry_run=False,
                 executed=False,
                 visible_in_terminal=visible_in_terminal,
                 open_new_terminal=open_new_terminal,
@@ -203,7 +186,6 @@ async def run_command(
                 ok=False,
                 command=command,
                 executed_command=exec_command,
-                dry_run=False,
                 executed=False,
                 visible_in_terminal=visible_in_terminal,
                 open_new_terminal=open_new_terminal,
@@ -226,7 +208,6 @@ async def run_command(
                 ok=True,
                 command=command,
                 executed_command=exec_command,
-                dry_run=False,
                 executed=True,
                 visible_in_terminal=True,
                 open_new_terminal=True,
@@ -238,7 +219,6 @@ async def run_command(
                 ok=False,
                 command=command,
                 executed_command=exec_command,
-                dry_run=False,
                 executed=False,
                 visible_in_terminal=True,
                 open_new_terminal=True,
@@ -267,7 +247,6 @@ async def run_command(
             ok=returncode == 0,
             command=command,
             executed_command=exec_command,
-            dry_run=False,
             executed=True,
             visible_in_terminal=True,
             open_new_terminal=False,
@@ -287,7 +266,6 @@ async def run_command(
         ok=proc.returncode == 0,
         command=command,
         executed_command=exec_command,
-        dry_run=False,
         executed=True,
         visible_in_terminal=False,
         open_new_terminal=False,

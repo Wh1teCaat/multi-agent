@@ -64,8 +64,7 @@ def build_default_tool_specs() -> list[ToolSpec]:
             tool=write_text_file,
             policy=ToolPolicy(
                 allow_in_recall=False,
-                require_confirm_param=True,
-                confirm_param_name="confirm",
+                require_confirm_param=False,
                 side_effect_level="high",
             ),
             description="写入文件",
