@@ -68,6 +68,7 @@ async def chat_endpoint(request: ChatRequest):
 
 class AgentInput(TypedDict):
     query: str
+    thread_id: str
 
 # 接口 B: LangServe 标准接口 (供调试、LangSmith 或高级流式前端调用)
 # URL: http://localhost:8000/agent/playground
@@ -76,11 +77,10 @@ async def langserve_wrapper(inputs: AgentInput):
     # LangServe 传进来的 inputs 通常是 {"messages": [...]}
     # 我们提取最后一条消息作为 query
     query = inputs["query"]
-    # 这里为了简单，暂时写死 thread_id，或者从 config 获取
-    # 实际生产中 LangServe 会通过 configurable 传递 thread_id
+    thread_id = inputs.get("thread_id", "default_thread")
     return await agent_instance.ainvoke(
         query=query,
-        thread_id="default_thread",
+        thread_id=thread_id,
 )
 
 langserve_runnable = RunnableLambda(langserve_wrapper)

@@ -1,9 +1,14 @@
+import ast
 import os
-from typing import TypedDict, Annotated, Optional
+import re
+from typing import Any, TypedDict, Annotated, Optional
+
+from langgraph.types import interrupt, Command
+from langgraph.errors import GraphInterrupt
 
 import dotenv
 import tiktoken
-from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg_pool import AsyncConnectionPool
 from langchain_openai import ChatOpenAI
@@ -11,33 +16,59 @@ from langgraph.graph import StateGraph
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel, Field
 
-from RAGAgent import call_rag_expert
-from SearchAgent import call_search_expert
+from tool_registry import build_default_tool_specs, build_tool_maps
+from tools.command_runtime import requires_second_confirmation
+from skills import SkillPrompts
 
 dotenv.load_dotenv()
 
 
+RECALL_PATTERNS = [
+    r"刚刚",
+    r"上一次|上个",
+    r"之前",
+    r"回顾",
+    r"总结上文|复述上文|回忆",
+    r"task\s*\d+.*(结论|结果|说了什么)",
+    r"我刚才.*(说|问)",
+    r"结论是什么",
+    r"结果是什么",
+]
+
+
+def _is_recall_query(text: str) -> bool:
+    if not text:
+        return False
+    normalized = text.strip().lower()
+    return any(re.search(p, normalized) for p in RECALL_PATTERNS)
+
+
 class Receipt(BaseModel):
-    """结构化输出"""
+    """结构化输出（含 ReAct 闭环过程）"""
     reason: str = Field(
-        default=None,
-        description="""
-        【思维链分析】
-        1. 用户最新一句话的意图是什么？（是延续上文，还是开启新任务？）
-        2. 如果需要回忆，请提取历史消息中的关键信息。
-        3. 解释为什么选择调用（或不调用）某个工具。
-        """
+        default="",
+        description="总体推理结论：说明意图判别、路径选择和为什么这样做。"
+    )
+    thought: str = Field(
+        default="",
+        description="行动前推理：当前子目标、信息缺口、是否需要工具。"
+    )
+    action: str = Field(
+        default="",
+        description="执行动作：调用了什么工具或采取了什么具体步骤。"
+    )
+    observation: str = Field(
+        default="",
+        description="行动观察：工具返回了什么证据、报错或状态变化。"
+    )
+    reflection: str = Field(
+        default="",
+        description="行动后反思：基于 observation 如何修正后续决策。"
     )
     answer: str = Field(
-        description="""
-        针对用户问题的最终回答内容。
-        【重要警告】：
-        - 如果用户要求写作文、写代码、写长文，此字段**必须包含完整的生成内容（全文）**。
-        - **严禁**只输出一句“已生成作文”或“见下文”之类的摘要。
-        - 必须是用户想看的那个结果本身。
-        """
+        description="针对用户问题的最终回答内容；若用户要求长文本/代码，必须给出完整内容。"
     )
-    source: list[str] = Field(description="回答中引用的具体文档名称或页码列表。如果没用到文档，请留空。")
+    source: list[str] = Field(default_factory=list, description="回答中引用的具体文档名称或页码列表。如果没用到文档，请留空。")
 
 
 class AgentState(TypedDict):
@@ -50,24 +81,97 @@ class Agent:
     def __init__(self, runnable, pool):
         self.runnable = runnable
         self.pool = pool
+        self.thread_answer_cache: dict[str, list[str]] = {}
+
+    async def aresume(self, thread_id: str, resume_value: Any):
+        return await self.ainvoke(Command(resume=resume_value), thread_id)
 
     @classmethod
     async def create(cls, max_tokens=5000):
         max_tokens = max_tokens
-        tools = [call_rag_expert, call_search_expert]
-        tools_by_name = {tool.name: tool for tool in tools}
+        tool_specs = build_default_tool_specs()
+        tools, tools_by_name, specs_by_name = build_tool_maps(tool_specs)
         llm = ChatOpenAI(model=os.getenv("MODEL_NAME"))
-        llm_with_tools = llm.bind_tools(tools)
+        llm_with_tools = llm.bind_tools(tools, tool_choice="auto")
         llm_structured = llm.with_structured_output(Receipt)
+
+        def _last_user_text(messages: list[BaseMessage]) -> str:    # 取出消息列表最后的用户消息文本
+            for msg in reversed(messages):
+                if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
+                    return msg.content
+            return ""
+
+        def _sanitize_tool_call_sequence(messages: list[BaseMessage]) -> list[BaseMessage]:
+            """修复历史中不完整的 tool_call -> tool_message 序列。"""
+            fixed: list[BaseMessage] = []
+            i = 0
+            total = len(messages)
+
+            while i < total:
+                msg = messages[i]
+                fixed.append(msg)
+
+                calls = msg.tool_calls if isinstance(msg, AIMessage) else None
+                if not calls:
+                    i += 1
+                    continue
+
+                required_ids = [c.get("id") for c in calls if c.get("id")]
+                seen_ids: set[str] = set()
+
+                j = i + 1
+                while j < total and isinstance(messages[j], ToolMessage):
+                    tool_msg = messages[j]
+                    fixed.append(tool_msg)
+                    if tool_msg.tool_call_id:
+                        seen_ids.add(tool_msg.tool_call_id)
+                    j += 1
+
+                for call_id in required_ids:
+                    if call_id not in seen_ids:
+                        fixed.append(
+                            ToolMessage(
+                                content="Error: 历史会话缺失该 tool_call 的执行回执，已自动补齐占位回执。",
+                                tool_call_id=call_id,
+                            )
+                        )
+
+                i = j
+
+            return fixed
+
+        def _approval_from_resume(resume_value: Any) -> bool:
+            """解析 interrupt 的 resume 值，True 为批准，False 为拒绝。"""
+            if isinstance(resume_value, bool):
+                return resume_value
+            if isinstance(resume_value, str):
+                normalized = resume_value.strip().lower()
+                return normalized in {"y", "yes", "true", "1", "ok", "approve", "approved", "允许", "同意", "是", "批准"}
+            if isinstance(resume_value, dict):
+                raw = resume_value.get("approved", resume_value.get("confirm", resume_value.get("decision")))
+                return _approval_from_resume(raw)
+            return False
+
 
         async def _structured_node(state: AgentState):
             messages = state["messages"]
             summary = state.get("summary", "")
+            messages = _sanitize_tool_call_sequence(messages)
+
+            skill_system = [
+                SystemMessage(content=SkillPrompts.ORCHESTRATION),
+                SystemMessage(content=SkillPrompts.INTENT_PRIORITY),
+                SystemMessage(content=SkillPrompts.REACT_LOOP),
+                SystemMessage(content=SkillPrompts.STRUCTURED_OUTPUT_POLICY),
+                SystemMessage(content=SkillPrompts.TOOL_POLICY),
+                SystemMessage(content=SkillPrompts.OUTPUT_POLICY),
+                SystemMessage(content="若上文存在 run_command 的工具回执，必须严格基于回执给出结论；禁止让用户再次手工去本地执行同一命令。"),
+            ]
 
             if summary:
-                prompt_msg = [SystemMessage(content=f"上下文摘要：{summary}")] + messages
+                prompt_msg = [SystemMessage(content=f"上下文摘要：{summary}")] + skill_system + messages
             else:
-                prompt_msg = messages
+                prompt_msg = skill_system + messages
 
             receipt = await llm_structured.ainvoke(prompt_msg)
             return {"structured_answer": receipt}
@@ -122,87 +226,138 @@ class Agent:
         async def _agent_node(state: AgentState):
             messages = state["messages"]
             summary = state.get("summary", "")
+            messages = _sanitize_tool_call_sequence(messages)
 
-            system_prompt = """你是一个高智能对话系统的**任务调度与决策中枢 (Central Orchestrator)**。
-
-            【角色定位】
-            你拥有多种专业工具的调用权限。你的核心职责不是机械地回复，而是作为**大脑**，分析用户意图，精准调度工具或调取记忆来解决问题。
-
-            【核心原则：最新指令优先 (Priority on Latest Instruction)】
-            在多轮对话中，用户意图经常会发生漂移（Intent Drift）。你必须严格遵守以下规则：
-            1. **锚定当下**：无论之前的对话上下文多么长（如长篇写作、代码生成），你必须**优先响应用户最新发送的一条指令**。
-            2. **打破惯性 (Break Context Inertia)**：
-               - 严禁被上文的格式带偏。如果上文是写作文，而用户最新问“几点了”，立即切换回简短回答模式，**绝对不要**再写一篇作文。
-               - 严禁在用户询问“回顾历史”时生成新内容。
-
-            【决策逻辑与资源调度】
-            请根据用户最新指令的性质，选择唯一的处理路径：
-            - **路径 A：需要外部能力**（如事实查询、计算、实时信息）
-              ➜ 必须调用对应的 **Tools**，严禁凭空猜测。
-            - **路径 B：需要回顾历史**（如“我刚才说什么了”、“总结上文”）
-              ➜ 调取 **对话历史 (Messages)** 或 **摘要 (Summary)** 进行事实复述。
-            - **路径 C：纯逻辑/闲聊**（如打招呼、通用问答）
-              ➜ 直接利用自身能力简练回复。
-
-            【思维链 (Reasoning) 协议】
-            在输出最终结果前，必须在 `reason` 字段中执行隐式推理：
-            1. **意图判别**：用户的最新意图属于上述哪种路径（A/B/C）？
-            2. **上下文清洗**：确认是否需要忽略上文的干扰信息（如长文本）？
-            3. **工具决策**：如果需要调用工具，理由是什么？
-            
-            【输出规范】
-            1. **完整性原则**：如果用户要求生成长文本（作文、报告、代码），你必须生成用户需要的答案。
-            2. **严禁偷懒**：不要因为是 JSON 格式就省略内容。
-
-            请保持客观、冷静、服务型的对话风格。"""
-            system_msg = [SystemMessage(content=system_prompt)]
+            prompt_msg: list[BaseMessage]
+            base_system = [
+                SystemMessage(content=SkillPrompts.ORCHESTRATION),
+                SystemMessage(content=SkillPrompts.INTENT_PRIORITY),
+                SystemMessage(content=SkillPrompts.REACT_LOOP),
+                SystemMessage(content=SkillPrompts.TOOL_POLICY),
+                SystemMessage(content=SkillPrompts.EXECUTION_POLICY),
+                SystemMessage(content=SkillPrompts.OUTPUT_POLICY),
+                SystemMessage(content="若上文存在 run_command 的工具回执，必须严格基于回执给出结论；禁止让用户再次手工去本地执行同一命令。"),
+            ]
 
             if summary:
-                system_msg.append(SystemMessage(content=f"之前的对话摘要：{summary}"))
+                prompt_msg = [SystemMessage(content=f"上下文摘要：{summary}")] + base_system + messages
+            else:
+                prompt_msg = base_system + messages
 
-            messages = system_msg + messages
+            response = await llm_with_tools.ainvoke(prompt_msg)
+            return {"messages": [response]}
 
-            result = await llm_with_tools.ainvoke(messages)
-            return {"messages": [result]}
 
         async def _tool_node(state: AgentState):
             last_msg = state["messages"][-1]
 
-            if not last_msg.tool_calls:
+            tool_calls = getattr(last_msg, "tool_calls", None)
+            if not tool_calls:
                 return {}
 
-            tool_msgs = []
-            for tool_call in last_msg.tool_calls:
-                name = tool_call["name"]
+            # 历史回顾类问题禁止调用工具，防止误触发 RAG/搜索造成答案漂移。
+            last_user_query = _last_user_text(state["messages"])
+            if _is_recall_query(last_user_query):
+                deny_msgs = []
+                for tool_call in tool_calls:
+                    spec = specs_by_name.get(tool_call.get("name"))
+                    if spec and spec.policy.allow_in_recall:
+                        continue
+                    else:
+                        deny_msgs.append(
+                            ToolMessage(
+                                content=(
+                                    "Error: 该问题属于会话历史回顾，禁止调用外部工具。"
+                                    "请直接依据 messages/summary 回答。"
+                                ),
+                                tool_call_id=tool_call["id"],
+                            )
+                        )
+                if deny_msgs:
+                    return {"messages": deny_msgs}
+
+            def _should_interrupt_tool_call(tool_name: str, tool_args: Any) -> tuple[bool, dict[str, Any]]:
+                """工具调用安全闸：
+                - 写入类工具：统一中断等待人工确认
+                - run_command：命令需要二次确认（或显式请求 confirm）时中断
+                """
+                spec = specs_by_name.get(tool_name)
+                args_dict: dict[str, Any] = tool_args if isinstance(tool_args, dict) else {}
+
+                # 统一：注册表声明为 high side-effect 的工具，默认要求人工确认
+                if spec and spec.policy.side_effect_level == "high":
+                    # run_command 属于 high，但我们对它做更细粒度判断，避免每次 ls 都中断
+                    if tool_name != "run_command":
+                        return True, {
+                            "reason": "该工具具有写入/副作用能力（side_effect_level=high），需人工二次确认。",
+                            "policy": {"side_effect_level": spec.policy.side_effect_level},
+                        }
+ 
+                if tool_name == "run_command":
+                    command_text = str(args_dict.get("command", "")).strip()
+                    requested_confirm = bool(args_dict.get("confirm", False))
+
+                    if requested_confirm:
+                        return True, {"reason": "命令请求以 confirm=true 执行（具备副作用），需人工二次确认。"}
+
+                    if requires_second_confirmation(command_text):
+                        return True, {"reason": "命令命中二次确认策略（高风险/副作用），需人工二次确认。"}
+
+                return False, {}
+
+            tool_msgs: list[ToolMessage] = []
+            for tool_call in tool_calls:
+                name = tool_call.get("name")
+                args = tool_call.get("args", {})
+
                 if name not in tools_by_name:
-                    output = f"Error: 调用不存在的工具"
+                    output = "Error: 调用不存在的工具"
                 else:
                     try:
+                        should_interrupt, risk = _should_interrupt_tool_call(name, args)
+                        if should_interrupt:
+                            resume_value = interrupt(
+                                {
+                                    "type": "human_approval_required",
+                                    "tool_name": name,
+                                    "args": args if isinstance(args, dict) else {},
+                                    "message": "工具为高风险操作，等待人工审批。",
+                                    "risk": risk,
+                                    "recovery_hint": "可在终端使用相同 thread_id 恢复会话并输入 yes/no 继续。",
+                                }
+                            )
+                            if not _approval_from_resume(resume_value):
+                                output = f"Error: 用户拒绝执行工具 {name}，本次工具调用失败。"
+                                tool_msgs.append(ToolMessage(content=str(output), tool_call_id=tool_call["id"]))
+                                continue
+
                         tool_func = tools_by_name[name]
-                        args = tool_call["args"]
                         output = await tool_func.ainvoke(args)
+                    except GraphInterrupt:
+                        raise
                     except Exception as e:
                         output = f"Error: {e}"
-                tool_msgs.append(
-                    ToolMessage(
-                        content=str(output),
-                        tool_call_id=tool_call["id"]
-                    )
-                )
+
+                tool_msgs.append(ToolMessage(content=str(output), tool_call_id=tool_call["id"]))
+
             return {"messages": tool_msgs}
 
         graph = StateGraph(AgentState)
+
         graph.add_node("summary", _summary_node)
         graph.add_node("agent", _agent_node)
         graph.add_node("tools", _tool_node)
+
         graph.add_node("formatter", _structured_node)
+        
         graph.set_entry_point("summary")
+        
         graph.add_edge("summary", "agent")
         graph.add_edge("tools", "agent")
 
         def agent_continue(state: AgentState):
             last_msg = state["messages"][-1]
-            if last_msg.tool_calls:
+            if getattr(last_msg, "tool_calls", None):
                 return "tools"
             else:
                 return "formatter"
@@ -235,24 +390,155 @@ class Agent:
         compiled_graph = graph.compile(checkpointer=checkpointer)
         return cls(compiled_graph, pool)
 
-    async def ainvoke(self, query: str, thread_id: str = None):
+    async def ainvoke(self, query: str | Command, thread_id: str = None):
         """
         封装后的调用接口
         :param query: 用户的纯文本问题
         :param thread_id: 会话 ID，用于记忆隔离
         :return: 最终的结构化结果 (Receipt 对象) 或 错误信息
         """
-        inputs = {"messages": [HumanMessage(content=query)]}
+        inputs: dict[str, Any] | Command
+        if isinstance(query, Command):
+            inputs = query
+        else:
+            # 回顾类问题改为“让模型基于记忆回答”，而不是只返回上一条缓存。
+            # 这里把本地缓存作为候选记忆注入，让模型综合 checkpoint 历史 + 摘要 + 候选结论给出回答。
+            if thread_id and _is_recall_query(query):
+                cached_answers = self.thread_answer_cache.get(thread_id, [])
+                if cached_answers:
+                    recent = cached_answers[-8:]
+                    memory_lines = "\n".join(f"- 记忆{i+1}: {item}" for i, item in enumerate(recent))
+                    query = (
+                        f"{query}\n\n"
+                        "以下是当前 thread 的候选记忆，请你基于完整会话上下文与这些候选信息进行回顾，"
+                        "不要只机械复述最后一条：\n"
+                        f"{memory_lines}"
+                    )
+            inputs = {"messages": [HumanMessage(content=query)]}
+
         config = {"configurable": {"thread_id": thread_id}} if thread_id else None
 
-        # 执行图
+        def _interrupt_response(*, interrupts: Any = None, payload: Any = None):
+            return {
+                "__interrupt__": interrupts or True,
+                "payload": payload,
+                "thread_id": thread_id,
+                "recovery": {
+                    "can_resume_in_terminal": True,
+                    "instruction": "使用相同 thread_id 在终端恢复，并输入 yes/no 进行审批。",
+                },
+            }
+
+        # 执行图：不捕获 GraphInterrupt，统一通过返回值中的 __interrupt__ 判断中断
         final_state = await self.runnable.ainvoke(inputs, config=config)
+
+        if final_state is None:
+            return {"error": "graph returned None"}
+
+        def _extract_interrupt_from_response(state: Any) -> tuple[Any, Any]:
+            """从响应中提取中断信息（仅基于响应内容，不捕获异常）。"""
+            if not isinstance(state, dict):
+                return None, None
+
+            # 1) 标准位置
+            if "__interrupt__" in state:
+                interrupts = state.get("__interrupt__")
+                if isinstance(interrupts, (list, tuple)) and interrupts:
+                    first = interrupts[0]
+                    payload = getattr(first, "value", None) or first
+                    return interrupts, payload
+                if interrupts:
+                    return interrupts, interrupts
+                return True, None
+
+            # 2) 兼容位置：有些实现会放在 interrupt/interrupts
+            for key in ("interrupt", "interrupts"):
+                if key in state and state.get(key):
+                    interrupts = state.get(key)
+                    if isinstance(interrupts, (list, tuple)) and interrupts:
+                        first = interrupts[0]
+                        payload = getattr(first, "value", None) or first
+                        return interrupts, payload
+                    return interrupts, interrupts
+
+            # 3) 消息携带：AIMessage.additional_kwargs["__interrupt__"]
+            messages = state.get("messages", [])
+            if isinstance(messages, list):
+                for msg in reversed(messages):
+                    additional = getattr(msg, "additional_kwargs", None)
+                    if isinstance(additional, dict) and "__interrupt__" in additional:
+                        interrupts = additional.get("__interrupt__")
+                        if isinstance(interrupts, (list, tuple)) and interrupts:
+                            first = interrupts[0]
+                            payload = getattr(first, "value", None) or first
+                            return interrupts, payload
+                        return interrupts or True, interrupts
+
+            return None, None
+
+        interrupts, payload = _extract_interrupt_from_response(final_state)
+        if interrupts is not None:
+            return _interrupt_response(interrupts=interrupts, payload=payload)
 
         # 优先返回结构化答案，如果没有（比如出错了），返回最后一条文本消息
         if final_state.get("structured_answer"):
-            return final_state["structured_answer"]
+            receipt = final_state["structured_answer"]
+            if isinstance(receipt, dict):
+                answer_text = str(receipt.get("answer", ""))
+            else:
+                answer_text = str(getattr(receipt, "answer", ""))
+
+            if any(k in answer_text for k in ["请在本地终端中运行", "请运行以下命令", "重新确认执行"]):
+                for msg in reversed(final_state.get("messages", [])):
+                    if not isinstance(msg, ToolMessage):
+                        continue
+                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    if "executed_command" not in content:
+                        continue
+                    try:
+                        data = ast.literal_eval(content)
+                    except Exception:
+                        continue
+                    if isinstance(data, dict) and data.get("executed"):
+                        cmd = data.get("executed_command") or data.get("command")
+                        rc = data.get("returncode")
+                        hint = data.get("hint") or ""
+                        answer_text = f"命令已执行：{cmd}；returncode={rc}。{hint}".strip()
+                        break
+
+            if isinstance(receipt, dict):
+                receipt["answer"] = answer_text
+                final_receipt = receipt
+            else:
+                setattr(receipt, "answer", answer_text)
+                final_receipt = receipt
+
+            if thread_id:
+                self.thread_answer_cache.setdefault(thread_id, []).append(answer_text)
+            return final_receipt
         else:
-            return final_state["messages"][-1].content
+            text = final_state["messages"][-1].content
+            text = str(text)
+            if any(k in str(text) for k in ["请在本地终端中运行", "请运行以下命令", "重新确认执行"]):
+                for msg in reversed(final_state.get("messages", [])):
+                    if not isinstance(msg, ToolMessage):
+                        continue
+                    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    if "executed_command" not in content:
+                        continue
+                    try:
+                        data = ast.literal_eval(content)
+                    except Exception:
+                        continue
+                    if isinstance(data, dict) and data.get("executed"):
+                        cmd = data.get("executed_command") or data.get("command")
+                        rc = data.get("returncode")
+                        hint = data.get("hint") or ""
+                        text = f"命令已执行：{cmd}；returncode={rc}。{hint}".strip()
+                        break
+            if thread_id:
+                self.thread_answer_cache.setdefault(thread_id, []).append(str(text))
+            return text
 
     async def aclose(self):
         await self.pool.close()

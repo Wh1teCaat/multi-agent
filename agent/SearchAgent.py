@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import TypedDict, List, Annotated
 
 import dotenv
+from pathlib import Path
+os.environ.setdefault("USER_AGENT", "multi-agent/1.0")
 from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.messages import BaseMessage, ToolMessage, HumanMessage
 from langchain_core.tools import tool
@@ -63,6 +65,9 @@ async def scrape_webpage(url: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+api_key = os.getenv("TAVILY_API_KEY")
+if not api_key:
+    raise RuntimeError(f"TAVILY_API_KEY 未加载")
 tavily = TavilySearch(max_results=3)
 tools = [get_current_time, calculator, scrape_webpage, tavily]
 tools_by_name = {tool.name: tool for tool in tools}
